@@ -24,11 +24,8 @@ Run CLI:   python crypto_wf_engine.py --input data.csv
 from __future__ import annotations
 
 import argparse
-import json
-import math
 import os
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict
 
 import numpy as np
 import pandas as pd
@@ -79,16 +76,18 @@ OUTPUT_DIR = "output"
 # HELPERS
 # =========================
 
-def sharpe(x):
+def sharpe(x, periods_per_year=365):
     s = pd.Series(x).dropna()
     if len(s) < 5 or s.std() == 0:
         return np.nan
-    return np.sqrt(252) * s.mean() / s.std()
+    return np.sqrt(periods_per_year) * s.mean() / s.std()
 
 def max_drawdown(eq):
     eq = pd.Series(eq).dropna()
     if eq.empty:
         return np.nan
+    # Include starting capital so a loss on the first evaluated bar counts.
+    eq = pd.concat([pd.Series([1.0]), eq.reset_index(drop=True)], ignore_index=True)
     return (eq / eq.cummax() - 1).min()
 
 def ensure_output_dir():
@@ -112,6 +111,10 @@ def validate_input(df):
         raise ValueError(f"Missing columns: {missing}")
 
     x = df.copy()
+    x = x[x["asset"].isin(ASSETS)].copy()
+    missing_assets = set(ASSETS) - set(x["asset"].unique())
+    if missing_assets:
+        raise ValueError(f"Configured assets missing from input: {sorted(missing_assets)}")
     x["date"] = pd.to_datetime(x["date"], utc=True, errors="coerce")
     if x["date"].isna().any():
         raise ValueError("Invalid dates found.")
@@ -191,25 +194,26 @@ def enforce_concentration_limits(
         g[position_col] = g[position_col] * (target_gross_leverage / gross)
         w = g[position_col].abs()
 
+        # Caps can make target leverage infeasible (for example, two selected
+        # assets with a 70% top-two cap). Preserve zero positions and allow the
+        # portfolio to run below target instead of inventing exposure.
         signs = np.sign(g[position_col])
         weights = g[position_col].abs().clip(upper=max_single_weight)
-
-        # Redistribute capped exposure without violating the single-name cap.
-        for _ in range(len(weights) + 1):
-            deficit = target_gross_leverage - weights.sum()
-            room = (max_single_weight - weights).clip(lower=0)
-            if deficit <= 1e-12 or room.sum() <= 1e-12:
-                break
-            weights += room / room.sum() * min(deficit, room.sum())
+        active = weights > 0
+        if active.any():
+            feasible_gross = min(target_gross_leverage, max_single_weight * active.sum())
+            for _ in range(len(weights) + 1):
+                deficit = feasible_gross - weights.sum()
+                room = (max_single_weight - weights).where(active, 0.0).clip(lower=0)
+                if deficit <= 1e-12 or room.sum() <= 1e-12:
+                    break
+                weights += room / room.sum() * min(deficit, room.sum())
 
         top = weights.sort_values(ascending=False).index[:2]
         excess = max(0.0, weights.loc[top].sum() - max_top2_weight)
         if excess:
-            weights.loc[top] -= excess / 2.0
-            others = weights.index.difference(top)
-            room = (max_single_weight - weights.loc[others]).clip(lower=0)
-            if room.sum() > 0:
-                weights.loc[others] += room / room.sum() * min(excess, room.sum())
+            top_total = weights.loc[top].sum()
+            weights.loc[top] *= (top_total - excess) / top_total
 
         g[position_col] = signs * weights
 
@@ -253,8 +257,9 @@ def make_positions(df, stress_q=STRESS_Q, skip_q=SKIP_Q, target_gross_lev=TARGET
 
     n_tradable = x.groupby("date")["rank"].transform(lambda s: s.notna().sum())
     x["position"] = 0.0
-    x.loc[tradable & (x["rank"] <= LONG_N), "position"] = 1.0 / LONG_N
-    x.loc[tradable & (x["rank"] > n_tradable - SHORT_N), "position"] = -1.0 / SHORT_N
+    enough_assets = n_tradable >= LONG_N + SHORT_N
+    x.loc[tradable & enough_assets & (x["rank"] <= LONG_N), "position"] = 1.0 / LONG_N
+    x.loc[tradable & enough_assets & (x["rank"] > n_tradable - SHORT_N), "position"] = -1.0 / SHORT_N
 
     gross = x.groupby("date")["position"].transform(lambda s: s.abs().sum())
     scale = np.where(gross > 0, target_gross_lev / gross, 0.0)
@@ -322,6 +327,22 @@ def apply_costs(
     x["gross_ret"] = x["prev_position"] * x["asset_ret"]
     x["net_ret"] = x["gross_ret"] - x["trade_cost"] + x["funding_pnl"]
     return x
+
+
+def aggregate_portfolio(bt):
+    """Collapse asset rows into one investable portfolio return per timestamp."""
+    if bt.empty:
+        return pd.DataFrame(columns=["date", "gross_ret", "trade_cost", "funding_pnl", "net_ret", "turnover"])
+    return (
+        bt.groupby("date", sort=True, as_index=False)
+        .agg(
+            gross_ret=("gross_ret", "sum"),
+            trade_cost=("trade_cost", "sum"),
+            funding_pnl=("funding_pnl", "sum"),
+            net_ret=("net_ret", "sum"),
+            turnover=("turnover", "sum"),
+        )
+    )
 
 
 # =========================
@@ -558,12 +579,7 @@ def evaluate_threshold(df, q, evaluation_dates=None):
     bt = apply_costs(pos)
     if evaluation_dates is not None:
         bt = bt[bt["date"].isin(evaluation_dates)].copy()
-    daily = bt.groupby("date", sort=True).agg(
-        net_ret=("net_ret", "sum"),
-        turnover=("turnover", "sum"),
-        trade_cost=("trade_cost", "sum"),
-        funding_pnl=("funding_pnl", "sum"),
-    )
+    daily = aggregate_portfolio(bt).set_index("date")
     s = daily["net_ret"].dropna()
     eq = (1 + s).cumprod()
 
@@ -579,11 +595,11 @@ def evaluate_threshold(df, q, evaluation_dates=None):
         "mean_funding_pnl": daily["funding_pnl"].mean(),
     }
 
-def summarize_oos(oos_table):
+def summarize_oos(oos_table, equity_table=None):
     if oos_table.empty:
         return pd.DataFrame()
 
-    return pd.DataFrame([{
+    out = {
         "folds": len(oos_table),
         "mean_oos_sharpe": oos_table["oos_sharpe"].mean(),
         "median_oos_sharpe": oos_table["oos_sharpe"].median(),
@@ -595,7 +611,18 @@ def summarize_oos(oos_table):
         "mean_oos_trade_cost": oos_table["mean_trade_cost"].mean(),
         "mean_oos_funding_pnl": oos_table["mean_funding_pnl"].mean(),
         "positive_folds": int((oos_table["oos_sharpe"] > 0).sum()),
-    }])
+    }
+    if equity_table is not None and not equity_table.empty:
+        stitched = equity_table.sort_values("date").drop_duplicates("date")
+        returns = stitched["net_ret"].dropna()
+        equity = (1.0 + returns).cumprod()
+        out.update({
+            "stitched_oos_sharpe": sharpe(returns),
+            "stitched_oos_ret": equity.iloc[-1] - 1.0 if len(equity) else np.nan,
+            "stitched_oos_mdd": max_drawdown(equity),
+            "oos_days": len(returns),
+        })
+    return pd.DataFrame([out])
 
 
 # =========================
@@ -663,10 +690,11 @@ def walk_forward_engine(df):
         test_bt = test_bt[test_bt["date"].isin(test_dates)].copy()
         test_bt["fold"] = fold
         test_bt["chosen_threshold"] = best_q
-        daily_ret = test_bt.groupby("date")["net_ret"].sum().sort_index()
-        daily_equity = (1 + daily_ret.fillna(0.0)).cumprod()
-        test_bt["equity"] = test_bt["date"].map(daily_equity)
-        equity_rows.append(test_bt[["date", "asset", "fold", "chosen_threshold", "net_ret", "equity", "regime"]])
+        daily_bt = aggregate_portfolio(test_bt)
+        daily_bt["fold"] = fold
+        daily_bt["chosen_threshold"] = best_q
+        daily_bt["equity"] = (1 + daily_bt["net_ret"].fillna(0.0)).cumprod()
+        equity_rows.append(daily_bt)
 
         if not plateau_tbl.empty:
             plateau_tbl = plateau_tbl.copy()
@@ -682,6 +710,9 @@ def walk_forward_engine(df):
     chosen_table = pd.DataFrame(chosen_rows)
     oos_table = pd.DataFrame(oos_rows)
     equity_table = pd.concat(equity_rows, ignore_index=True) if equity_rows else pd.DataFrame()
+    if not equity_table.empty:
+        equity_table = equity_table.sort_values(["date", "fold"]).drop_duplicates("date", keep="first").reset_index(drop=True)
+        equity_table["equity"] = (1.0 + equity_table["net_ret"].fillna(0.0)).cumprod()
 
     return grid_table, chosen_table, oos_table, equity_table
 
@@ -695,7 +726,7 @@ def run_engine(input_csv, out_prefix="crypto_wf"):
     df["date"] = pd.to_datetime(df["date"], utc=True)
 
     grid_table, chosen_table, oos_table, equity_table = walk_forward_engine(df)
-    summary = summarize_oos(oos_table)
+    summary = summarize_oos(oos_table, equity_table)
 
     save_df(grid_table, f"{out_prefix}_threshold_grid.csv")
     save_df(chosen_table, f"{out_prefix}_chosen_thresholds.csv")
@@ -717,7 +748,7 @@ def run_engine(input_csv, out_prefix="crypto_wf"):
 # =========================
 
 def _make_synth_df():
-    dates = pd.date_range("2024-01-01", periods=160, freq="D", tz="UTC")
+    dates = pd.date_range("2023-01-01", periods=600, freq="D", tz="UTC")
     assets = ASSETS
     rows = []
     for a in assets:
@@ -732,12 +763,12 @@ def _make_synth_df():
                 "high": p * 1.01,
                 "low": p * 0.98,
                 "close": p,
-                "volume": 1_000_000,
+                "volume": 1_000_000 + (d.dayofyear % 7) * 10_000,
             })
     return pd.DataFrame(rows)
 
 def _make_synth_funding():
-    dates = pd.date_range("2024-01-01", periods=160, freq="D", tz="UTC")
+    dates = pd.date_range("2023-01-01", periods=600, freq="D", tz="UTC")
     rows = []
     for a in ASSETS:
         for i, d in enumerate(dates):
@@ -768,7 +799,50 @@ def test_concentration_caps_hold():
     w = out["position"].abs()
     assert w.max() <= 0.40 + 1e-9
     assert w.sort_values(ascending=False).iloc[:2].sum() <= 0.70 + 1e-9
+    assert w.sum() <= 1.0 + 1e-9
     assert abs(w.sum() - 1.0) <= 1e-9
+
+def test_concentration_does_not_create_new_positions():
+    df = pd.DataFrame({
+        "date": pd.to_datetime(["2024-01-01"] * 4, utc=True),
+        "asset": ASSETS,
+        "position": [0.5, -0.5, 0.0, 0.0],
+    })
+    out = enforce_concentration_limits(df)
+    assert (out.loc[out["asset"].isin(["XDC", "PI"]), "position"] == 0).all()
+    assert out["position"].abs().sum() <= MAX_TOP2_WEIGHT + 1e-9
+
+def test_apply_costs_never_crosses_asset_boundaries():
+    dates = pd.date_range("2024-01-01", periods=3, freq="D", tz="UTC")
+    df = pd.DataFrame({
+        "date": list(dates) * 2,
+        "asset": ["XRP"] * 3 + ["XLM"] * 3,
+        "close": [100.0, 110.0, 121.0, 50.0, 50.0, 50.0],
+        "position": [1.0] * 6,
+        "vol_ratio": [1.0] * 6,
+    })
+    out = apply_costs(df, use_funding=False)
+    xrp = out[out["asset"] == "XRP"].sort_values("date")
+    xlm = out[out["asset"] == "XLM"].sort_values("date")
+    assert np.allclose(xrp["asset_ret"].iloc[1:], 0.10)
+    assert np.allclose(xlm["asset_ret"].iloc[1:], 0.0)
+
+def test_portfolio_aggregation_produces_one_row_per_date():
+    dates = pd.date_range("2024-01-01", periods=3, freq="D", tz="UTC")
+    bt = pd.DataFrame({
+        "date": np.repeat(dates, 2),
+        "gross_ret": [0.01, -0.005] * 3,
+        "trade_cost": [0.001, 0.001] * 3,
+        "funding_pnl": [0.0] * 6,
+        "net_ret": [0.009, -0.006] * 3,
+        "turnover": [0.5, 0.5] * 3,
+    })
+    daily = aggregate_portfolio(bt)
+    assert len(daily) == 3
+    assert np.allclose(daily["net_ret"], 0.003)
+
+def test_drawdown_includes_first_period_loss():
+    assert np.isclose(max_drawdown(pd.Series([0.90, 0.95])), -0.10)
 
 def test_negative_funding_hurts_shorts_with_zero_price_returns():
     dates = pd.date_range("2024-01-01", periods=4, freq="D", tz="UTC")
@@ -861,6 +935,12 @@ def test_walk_forward_runs():
     assert isinstance(chosen, pd.DataFrame)
     assert isinstance(oos, pd.DataFrame)
     assert isinstance(eq, pd.DataFrame)
+    assert not grid.empty
+    assert not chosen.empty
+    assert not oos.empty
+    assert not eq.empty
+    assert eq["date"].is_unique
+    assert eq["turnover"].sum() > 0
 
 
 # =========================
@@ -879,7 +959,7 @@ def main():
     else:
         df = _make_synth_df()
         grid, chosen, oos, eq = walk_forward_engine(df)
-        summary = summarize_oos(oos)
+        summary = summarize_oos(oos, eq)
         print(summary.to_string(index=False))
         save_df(grid, f"{args.out_prefix}_threshold_grid.csv")
         save_df(chosen, f"{args.out_prefix}_chosen_thresholds.csv")
