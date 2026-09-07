@@ -24,6 +24,7 @@ Run CLI:   python crypto_wf_engine.py --input data.csv
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from typing import Dict
 
@@ -70,6 +71,7 @@ MAX_TOP2_WEIGHT = 0.70
 MIN_OBS_PER_FOLD = 120
 
 OUTPUT_DIR = "output"
+ENGINE_VERSION = "2.1.0"
 
 
 # =========================
@@ -97,6 +99,34 @@ def save_df(df, name):
     ensure_output_dir()
     path = os.path.join(OUTPUT_DIR, name)
     df.to_csv(path, index=False)
+    return path
+
+
+def engine_metadata():
+    """Return the assumptions needed to reproduce an engine run."""
+    return {
+        "engine_version": ENGINE_VERSION,
+        "assets": ASSETS,
+        "walk_forward": {"train_days": TRAIN_DAYS, "test_days": TEST_DAYS, "step_days": STEP_DAYS},
+        "thresholds": THRESHOLDS,
+        "target_gross_leverage": TARGET_GROSS_LEV,
+        "selection": {"long_n": LONG_N, "short_n": SHORT_N},
+        "costs_bps": {"fee": FEE_BPS, "spread": SPREAD_BPS, "base_slippage": BASE_SLIP_BPS},
+        "funding": {"enabled": USE_FUNDING, "static_bps_per_8h": FUNDING_BPS_PER_8H},
+        "risk": {
+            "maintenance_margin_rate": MAINT_MARGIN_RATE,
+            "liquidation_penalty_rate": LIQ_PENALTY_RATE,
+            "max_single_weight": MAX_SINGLE_WEIGHT,
+            "max_top2_weight": MAX_TOP2_WEIGHT,
+        },
+    }
+
+
+def save_metadata(name):
+    ensure_output_dir()
+    path = os.path.join(OUTPUT_DIR, name)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(engine_metadata(), handle, indent=2)
     return path
 
 
@@ -733,6 +763,7 @@ def run_engine(input_csv, out_prefix="crypto_wf"):
     save_df(oos_table, f"{out_prefix}_oos_results.csv")
     save_df(equity_table, f"{out_prefix}_oos_equity.csv")
     save_df(summary, f"{out_prefix}_summary.csv")
+    save_metadata(f"{out_prefix}_metadata.json")
 
     return {
         "grid_table": grid_table,
@@ -844,6 +875,13 @@ def test_portfolio_aggregation_produces_one_row_per_date():
 def test_drawdown_includes_first_period_loss():
     assert np.isclose(max_drawdown(pd.Series([0.90, 0.95])), -0.10)
 
+def test_metadata_captures_reproducibility_assumptions():
+    metadata = engine_metadata()
+    assert metadata["engine_version"] == ENGINE_VERSION
+    assert metadata["assets"] == ASSETS
+    assert metadata["walk_forward"]["test_days"] == TEST_DAYS
+    assert metadata["costs_bps"]["fee"] == FEE_BPS
+
 def test_negative_funding_hurts_shorts_with_zero_price_returns():
     dates = pd.date_range("2024-01-01", periods=4, freq="D", tz="UTC")
     df = pd.DataFrame({
@@ -949,6 +987,7 @@ def test_walk_forward_runs():
 
 def main():
     p = argparse.ArgumentParser()
+    p.add_argument("--version", action="version", version=f"%(prog)s {ENGINE_VERSION}")
     p.add_argument("--input", required=False, help="CSV input with date, asset, open, high, low, close, volume")
     p.add_argument("--out-prefix", default="crypto_wf")
     args = p.parse_args()
@@ -966,6 +1005,7 @@ def main():
         save_df(oos, f"{args.out_prefix}_oos_results.csv")
         save_df(eq, f"{args.out_prefix}_oos_equity.csv")
         save_df(summary, f"{args.out_prefix}_summary.csv")
+        save_metadata(f"{args.out_prefix}_metadata.json")
 
 if __name__ == "__main__":
     main()

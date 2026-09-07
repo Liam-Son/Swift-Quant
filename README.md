@@ -27,6 +27,14 @@ python crypto_wf_engine.py --input your_data.csv --out-prefix crypto_wf
 ```
 
 The engine writes threshold-selection, out-of-sample performance, equity, and summary CSV files under `output/`.
+It also writes a metadata JSON file containing the engine version and the assumptions
+needed to reproduce the run.
+
+Check the installed engine version with:
+
+```powershell
+python crypto_wf_engine.py --version
+```
 
 Run the embedded test suite with:
 
