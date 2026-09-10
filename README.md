@@ -43,3 +43,7 @@ python -m pytest crypto_wf_engine.py -q
 ```
 
 The earlier `swift_quant.py` prototype remains available for comparison.
+
+---
+
+Lab status: [STATUS.md](STATUS.md)
